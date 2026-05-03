@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Secrets & local config
+.env
+.env.*
+*.pem
+.ring-token
+
+# Runtime output (default LaCie path name may appear under project during dev)
+Ring_Videos/
+ring_downloads/
+videos/
+*.log
+sample*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# Optional Playwright browser cache
+.cache/
