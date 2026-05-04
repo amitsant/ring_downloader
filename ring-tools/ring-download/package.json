@@ -4,8 +4,9 @@
   "type": "module",
   "scripts": {
     "download": "node download.js",
-    "download:full": "RING_START=2026-03-03 RING_END=2026-05-02 RING_TRANSCODE=auto node download.js",
-    "reencode": "RING_REENCODE_ONLY=1 node download.js"
+    "download:full": "RING_START=2026-03-03 RING_END=2026-05-02 node download.js",
+    "reencode": "RING_REENCODE_ONLY=1 node download.js",
+    "reencode:through-mar8": "RING_REENCODE_ONLY=1 RING_REENCODE_END=2026-03-08 node download.js"
   },
   "dependencies": {
     "got": "^14.4.2",

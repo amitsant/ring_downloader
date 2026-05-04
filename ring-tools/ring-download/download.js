@@ -10,8 +10,9 @@
  *   RING_SKIP_DOORBELL — if "1" or "true", skip devices whose name contains "doorbell"
  *   RING_FORCE         — if "1" or "true", re-download even when the .mp4 already exists
  *   RING_ALLOW_SHARE_PLAY — if "1", allow share/play fallback (often audio-only; default off)
- *   RING_TRANSCODE      — auto (default): ffmpeg transcodes when video isn’t QuickTime-friendly H.264
- *                         use "1"/always to force transcode; "0" to disable
+ *   RING_TRANSCODE      — always (default): re-encode every clip for QuickTime (H.264/AAC); slower but reliable
+ *                         set to "auto" to skip when already H.264+yuv420p (faster; QuickTime may still fail on some Ring files)
+ *                         "0" disables transcoding
  *   RING_FFMPEG / RING_FFPROBE — paths if not on PATH (default: ffmpeg, ffprobe)
  *   RING_ALLOW_AUDIO_ONLY — if "1", keep clips that have no video track (default: discard & try next URL)
  *
@@ -26,7 +27,10 @@
  *   RING_NO_LOG       — if "1", disable file logging entirely
  *
  *   RING_REENCODE_ONLY — if "1": no Ring download; run ffmpeg QuickTime pass on existing MP4s under RING_OUTPUT_DIR.
- *                         Optional RING_REENCODE_SUBDIR=2026-03-04 to limit to that date folder only (no token needed).
+ *                         Optional RING_REENCODE_SUBDIR=2026-03-04 — single day folder only (overrides range).
+ *                         Optional RING_REENCODE_START / RING_REENCODE_END (YYYY-MM-DD, inclusive) — only first-level
+ *                         date folders under RING_OUTPUT_DIR in that range (omit START for “from earliest”, omit END for “through latest”).
+ *                         If none of these are set, the entire tree under RING_OUTPUT_DIR is processed (no token needed).
  */
 
 import { RingApi } from 'ring-client-api'
@@ -67,9 +71,9 @@ const allowAudioOnly = /^1|true|yes$/i.test(
 const ffmpegBin = process.env.RING_FFMPEG ?? 'ffmpeg'
 const ffprobeBin = process.env.RING_FFPROBE ?? 'ffprobe'
 
-/** auto | always | off — Ring CDN/clips are often HEVC or odd MP4; QuickTime wants H.264 + yuv420p. */
+/** auto | always | off — Default always: Ring often labels files as H.264 but QuickTime still needs a full remux. */
 function transcodeMode() {
-  const raw = (process.env.RING_TRANSCODE ?? 'auto').trim().toLowerCase()
+  const raw = (process.env.RING_TRANSCODE ?? 'always').trim().toLowerCase()
   if (/^0|false|no|off$/.test(raw)) return 'off'
   if (/^1|true|yes|always|force$/.test(raw)) return 'always'
   return 'auto'
@@ -673,16 +677,19 @@ function* walkMp4Files(dir) {
   }
 }
 
-/**
- * Offline: re-run ffmpeg QuickTime pass on files already on disk (HEVC → H.264, etc.).
- * Does not call Ring. Use VLC/IINA for originals; this fixes QuickTime broadly.
- */
-async function reencodeExistingLibrary(rootDir) {
-  console.log(`🔧 Re-encoding existing .mp4 files under:\n   ${rootDir}`)
-  console.log(
-    `   RING_TRANSCODE=${process.env.RING_TRANSCODE ?? 'auto'} (use always to force every file)`,
-  )
+const ISO_TOPLEVEL_DAY = /^\d{4}-\d{2}-\d{2}$/
 
+function assertOptionalReencodeDay(val, label) {
+  const s = String(val ?? '').trim()
+  if (!s) return ''
+  if (!ISO_TOPLEVEL_DAY.test(s)) {
+    console.error(`${label} must be YYYY-MM-DD (got: ${val})`)
+    process.exit(1)
+  }
+  return s
+}
+
+async function assertFfmpegForReencode() {
   try {
     await execFileAsync(ffmpegBin, ['-hide_banner', '-version'], {
       timeout: 5000,
@@ -691,6 +698,19 @@ async function reencodeExistingLibrary(rootDir) {
     console.error('ffmpeg is required. Install: brew install ffmpeg')
     process.exit(1)
   }
+}
+
+/**
+ * Offline: re-run ffmpeg QuickTime pass on files already on disk (HEVC → H.264, etc.).
+ * Does not call Ring. Use VLC/IINA for originals; this fixes QuickTime broadly.
+ */
+async function reencodeExistingLibrary(rootDir) {
+  console.log(`🔧 Re-encoding existing .mp4 files under:\n   ${rootDir}`)
+  console.log(
+    `   RING_TRANSCODE=${process.env.RING_TRANSCODE ?? 'always'} (set auto for faster, less reliable QuickTime)`,
+  )
+
+  await assertFfmpegForReencode()
 
   let n = 0
   for (const fp of walkMp4Files(rootDir)) {
@@ -702,16 +722,77 @@ async function reencodeExistingLibrary(rootDir) {
   console.log(`\n📊 Re-encode pass finished — ${n} .mp4 file(s) processed`)
 }
 
+/**
+ * Like reencodeExistingLibrary, but only first-level folders named YYYY-MM-DD within [startStr, endStr] (string order).
+ */
+async function reencodeExistingLibraryByDateRange(rootDir, startStr, endStr) {
+  console.log(`🔧 Re-encoding .mp4 files in date folders under:\n   ${rootDir}`)
+  console.log(
+    `   Range (inclusive): ${startStr || '…'} … ${endStr || '…'}  |  RING_TRANSCODE=${process.env.RING_TRANSCODE ?? 'always'}`,
+  )
+
+  await assertFfmpegForReencode()
+
+  if (!fs.existsSync(rootDir)) {
+    console.error(`Output folder does not exist: ${rootDir}`)
+    process.exit(1)
+  }
+
+  const days = fs
+    .readdirSync(rootDir)
+    .filter((name) => ISO_TOPLEVEL_DAY.test(name))
+    .filter((name) => (!startStr || name >= startStr) && (!endStr || name <= endStr))
+    .sort()
+
+  if (days.length === 0) {
+    console.log('\n📊 No date folders in range — 0 .mp4 file(s) processed')
+    return
+  }
+
+  let n = 0
+  for (const d of days) {
+    const folder = path.join(rootDir, d)
+    if (!fs.statSync(folder).isDirectory()) continue
+    console.log(`\n📅 ${d}`)
+    for (const fp of walkMp4Files(folder)) {
+      n++
+      console.log(`▶ ${fp}`)
+      await ensureQuickTimeMp4(fp)
+    }
+  }
+
+  console.log(`\n📊 Re-encode pass finished — ${n} .mp4 file(s) processed`)
+}
+
 async function main() {
   if (reencodeOnly) {
-    let root = outputDir
     const sub = process.env.RING_REENCODE_SUBDIR?.trim()
-    if (sub) {
-      root = path.join(outputDir, sub)
-      console.log(`📂 Limiting to subfolder: ${sub}`)
+    const startRe = assertOptionalReencodeDay(
+      process.env.RING_REENCODE_START,
+      'RING_REENCODE_START',
+    )
+    const endRe = assertOptionalReencodeDay(
+      process.env.RING_REENCODE_END,
+      'RING_REENCODE_END',
+    )
+    if (startRe && endRe && startRe > endRe) {
+      console.error('RING_REENCODE_START must be <= RING_REENCODE_END')
+      process.exit(1)
     }
+
     console.log(`📁 Output: ${outputDir}  (re-encode only — no download)`)
-    await reencodeExistingLibrary(root)
+    if (sub) {
+      const root = path.join(outputDir, sub)
+      console.log(`📂 Limiting to subfolder: ${sub}`)
+      await reencodeExistingLibrary(root)
+    } else if (startRe || endRe) {
+      console.log(
+        `📂 Date folders: ${startRe || '(earliest)'} … ${endRe || '(latest)'} (inclusive)`,
+      )
+      await reencodeExistingLibraryByDateRange(outputDir, startRe, endRe)
+    } else {
+      await reencodeExistingLibrary(outputDir)
+    }
     console.log('\n🎉 DONE')
     return
   }
